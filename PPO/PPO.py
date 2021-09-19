@@ -4,7 +4,7 @@ from torch.distributions import Categorical
 import gym
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-#2
+
 
 # 定义数组变量
 class Memory:
