@@ -33,10 +33,11 @@ class ReplayBuffer(object):
         self.not_done[self.ptr] = 1. - done
 
         self.ptr = (self.ptr + 1) % self.max_size
-        self.size = min(self.size + 1, self.max_size)
+        self.size = min(self.size + 1, self.max_size)  # 限位
 
     # 随机采样
     def sample(self, batch_size):
+        # 随机抽取要训练的数据
         ind = np.random.randint(0, self.size, size=batch_size)
 
         return (
@@ -49,34 +50,34 @@ class ReplayBuffer(object):
 
 
 class Actor(nn.Module):
-    def __init__(self, state_dim, action_dim, max_action):
+    def __init__(self, state_dim, action_dim, max_action, n_latent_var):
         super(Actor, self).__init__()
 
-        self.l1 = nn.Linear(state_dim, 256)
-        self.l2 = nn.Linear(256, 256)
-        self.l3 = nn.Linear(256, action_dim)
+        self.l1 = nn.Linear(state_dim, n_latent_var)
+        self.l2 = nn.Linear(n_latent_var, n_latent_var)
+        self.l3 = nn.Linear(n_latent_var, action_dim)
 
         self.max_action = max_action
 
     def forward(self, state):
         a = F.relu(self.l1(state))
         a = F.relu(self.l2(a))
-        return self.max_action * torch.tanh(self.l3(a))
+        return self.max_action * torch.tanh(self.l3(a)) # 通过tanh后再进行尺寸缩放成实际Action值
 
 
 class Critic(nn.Module):
-    def __init__(self, state_dim, action_dim):
+    def __init__(self, state_dim, action_dim, n_latent_var):
         super(Critic, self).__init__()
 
         # Q1 architecture
-        self.l1 = nn.Linear(state_dim + action_dim, 256)
-        self.l2 = nn.Linear(256, 256)
-        self.l3 = nn.Linear(256, 1)
+        self.l1 = nn.Linear(state_dim + action_dim, n_latent_var)
+        self.l2 = nn.Linear(n_latent_var, n_latent_var)
+        self.l3 = nn.Linear(n_latent_var, 1)
 
         # Q2 architecture
-        self.l4 = nn.Linear(state_dim + action_dim, 256)
-        self.l5 = nn.Linear(256, 256)
-        self.l6 = nn.Linear(256, 1)
+        self.l4 = nn.Linear(state_dim + action_dim, n_latent_var)
+        self.l5 = nn.Linear(n_latent_var, n_latent_var)
+        self.l6 = nn.Linear(n_latent_var, 1)
 
     def forward(self, state, action):
         sa = torch.cat([state, action], 1)
@@ -105,6 +106,7 @@ class TD3(object):
             state_dim,
             action_dim,
             max_action,
+            n_latent_var,
             discount=0.99,
             tau=0.005,
             policy_noise=0.2,
@@ -112,11 +114,11 @@ class TD3(object):
             policy_freq=2
     ):
 
-        self.actor = Actor(state_dim, action_dim, max_action).to(device)
+        self.actor = Actor(state_dim, action_dim, max_action, n_latent_var).to(device)
         self.actor_target = copy.deepcopy(self.actor)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=3e-4)
 
-        self.critic = Critic(state_dim, action_dim).to(device)
+        self.critic = Critic(state_dim, action_dim, n_latent_var).to(device)
         self.critic_target = copy.deepcopy(self.critic)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=3e-4)
 
@@ -136,11 +138,11 @@ class TD3(object):
     def train(self, replay_buffer, batch_size=256):
         self.total_it += 1
 
-        # Sample replay buffer
+        # 从buffer里随机采样数据
         state, action, next_state, reward, not_done = replay_buffer.sample(batch_size)
 
         with torch.no_grad():
-            # Select action according to policy and add clipped noise
+            # 添加clipped噪声
             noise = (
                     torch.randn_like(action) * self.policy_noise
             ).clamp(-self.noise_clip, self.noise_clip)
@@ -149,34 +151,35 @@ class TD3(object):
                     self.actor_target(next_state) + noise
             ).clamp(-self.max_action, self.max_action)
 
-            # Compute the target Q value
+            # 计算Q_target_value
             target_Q1, target_Q2 = self.critic_target(next_state, next_action)
+            # 取min
             target_Q = torch.min(target_Q1, target_Q2)
             target_Q = reward + not_done * self.discount * target_Q
 
-        # Get current Q estimates
+        # 得到当前Q估计
         current_Q1, current_Q2 = self.critic(state, action)
 
-        # Compute critic loss
+        # 计算当前Q_critic loss
         critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q)
 
-        # Optimize the critic
+        # 求梯度
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
         self.critic_optimizer.step()
 
-        # Delayed policy updates
+        # 延迟policy更新（actor更新慢）
         if self.total_it % self.policy_freq == 0:
 
-            # Compute actor losse
+            # 计算actor losse
             actor_loss = -self.critic.Q1(state, self.actor(state)).mean()
 
-            # Optimize the actor
+            # 求梯度
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
             self.actor_optimizer.step()
 
-            # Update the frozen target models
+            # 更新target网络参数
             for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
                 target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
@@ -209,18 +212,18 @@ def main():
     # action_dim = env.action_space.n
     render = True
 
-
-    seed=0  # Sets Gym, PyTorch and Numpy seeds
-    start_timesteps=25e3  # Time steps initial random policy is used
-    eval_freq=5e3  # How often (time steps) we evaluate
-    max_timesteps=1e6  # Max time steps to run environment
-    expl_noise=0.1  # Std of Gaussian exploration noise
-    batch_size=256  # Batch size for both actor and critic
-    discount=0.99  # Discount factor
-    tau=0.005  # Target network update rate
-    policy_noise=0.2  # Noise added to target policy during critic update
-    noise_clip=0.5  # Range to clip target policy noise
-    policy_freq=2  # Frequency of delayed policy updates
+    seed = 0  # 设置随机数种子
+    n_latent_var = 256  # 隐藏层数量
+    start_timesteps = 25e3  # 初始随机步数
+    eval_freq = 5e3  # How often (time steps) we evaluate
+    max_timesteps = 1e6  # 最大步数Max time steps to run environment
+    expl_noise = 0.1  # 高斯噪声
+    batch_size = 256  # 采样数据个数
+    discount = 0.99  # 折扣因子
+    tau = 0.005  # 目标网络更新比例
+    policy_noise = 0.2  # 更新critic时添加到target_policy的噪声Noise added to target policy during critic update
+    noise_clip = 0.5  # 添加到target_policy的噪声范围
+    policy_freq = 2  # policy延迟更新频率（actor）
     #############################################
 
     # Set seeds
@@ -237,60 +240,58 @@ def main():
         "state_dim": state_dim,
         "action_dim": action_dim,
         "max_action": max_action,
+        "n_latent_var": n_latent_var,
         "discount": discount,
         "tau": tau,
+        # Target policy 平滑处理
+        "policy_noise": policy_noise * max_action,
+        "noise_clip": noise_clip * max_action,
+        "policy_freq": policy_freq
     }
 
-    # Initialize policy
-    # Target policy smoothing is scaled wrt the action scale
-    kwargs["policy_noise"] = policy_noise * max_action
-    kwargs["noise_clip"] = noise_clip * max_action
-    kwargs["policy_freq"] = policy_freq
+    # 初始化policy
     policy = TD3(**kwargs)
-
+    # 初始化buffer
     replay_buffer = ReplayBuffer(state_dim, action_dim)
-
-    # Evaluate untrained policy
-    # evaluations = [eval_policy(policy, env, seed)]
-
-    state, done = env.reset(), False
+    # 参数初始化
     episode_reward = 0
     episode_timesteps = 0
     episode_num = 0
 
+    # 主循环
     for t in range(int(max_timesteps)):
-
+        state, done = env.reset(), False
         episode_timesteps += 1
 
-        # Select action randomly or according to policy
-        if t < start_timesteps:
-            action = env.action_space.sample()
+        # 选择Action
+        if t < start_timesteps: # 初始先随机跑，存数据
+            action = env.action_space.sample()  # 随机从动作空间中选取动作
         else:
             action = (
                     policy.select_action(np.array(state))
-                    + np.random.normal(0, max_action * expl_noise, size=action_dim)
+                    + np.random.normal(0, max_action * expl_noise, size=action_dim)  # 加入噪声
             ).clip(-max_action, max_action)
 
-        # Perform action
+        # 得到（新的状态，奖励，是否终止，额外的调试信息）
         next_state, reward, done, _ = env.step(action)
         done_bool = float(done) if episode_timesteps < env._max_episode_steps else 0
 
-        # Store data in replay buffer
+        # 保存数据
         replay_buffer.add(state, action, next_state, reward, done_bool)
 
         state = next_state
         episode_reward += reward
+        env.render()
 
-        # Train agent after collecting sufficient data
-        if t >= start_timesteps:
+        # 训练policy
+        if t >= start_timesteps:  # 收集到足够多的数据
             policy.train(replay_buffer, batch_size)
 
         if done:
             # +1 to account for 0 indexing. +0 on ep_timesteps since it will increment +1 even if done=True
             print(
                 f"Total T: {t + 1} Episode Num: {episode_num + 1} Episode T: {episode_timesteps} Reward: {episode_reward:.3f}")
-            # Reset environment
-            state, done = env.reset(), False
+            # 数据清零
             episode_reward = 0
             episode_timesteps = 0
             episode_num += 1
@@ -300,6 +301,7 @@ def main():
         #     evaluations.append(eval_policy(policy, env, seed))
         #     np.save(f"./results/{file_name}", evaluations)
         #     if save_model: policy.save(f"./models/{file_name}")
+
 
 if __name__ == '__main__':
     main()
