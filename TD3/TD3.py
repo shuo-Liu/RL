@@ -3,12 +3,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
 import gym
+import os
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
-# Implementation of Twin Delayed Deep Deterministic Policy Gradients (TD3)
 
 # 经验Buffer
 class ReplayBuffer(object):
@@ -69,12 +69,12 @@ class Critic(nn.Module):
     def __init__(self, state_dim, action_dim, n_latent_var):
         super(Critic, self).__init__()
 
-        # Q1 architecture
+        # Q1
         self.l1 = nn.Linear(state_dim + action_dim, n_latent_var)
         self.l2 = nn.Linear(n_latent_var, n_latent_var)
         self.l3 = nn.Linear(n_latent_var, 1)
 
-        # Q2 architecture
+        # Q2
         self.l4 = nn.Linear(state_dim + action_dim, n_latent_var)
         self.l5 = nn.Linear(n_latent_var, n_latent_var)
         self.l6 = nn.Linear(n_latent_var, 1)
@@ -98,6 +98,7 @@ class Critic(nn.Module):
         q1 = F.relu(self.l2(q1))
         q1 = self.l3(q1)
         return q1
+
 
 
 class TD3(object):
@@ -203,20 +204,20 @@ class TD3(object):
         self.actor_target = copy.deepcopy(self.actor)
 
 
+
 def main():
     ############## 参数设定 ##############
     env_name = "Pendulum-v0"
     # 生成仿真环境
     env = gym.make(env_name)
-    # state_dim = env.observation_space.shape[0]
-    # action_dim = env.action_space.n
-    render = True
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    max_action = float(env.action_space.high[0])
+    render = False
 
     seed = 0  # 设置随机数种子
     n_latent_var = 256  # 隐藏层数量
     start_timesteps = 25e3  # 初始随机步数
-    eval_freq = 5e3  # How often (time steps) we evaluate
-    max_timesteps = 1e6  # 最大步数Max time steps to run environment
     expl_noise = 0.1  # 高斯噪声
     batch_size = 256  # 采样数据个数
     discount = 0.99  # 折扣因子
@@ -224,17 +225,22 @@ def main():
     policy_noise = 0.2  # 更新critic时添加到target_policy的噪声Noise added to target policy during critic update
     noise_clip = 0.5  # 添加到target_policy的噪声范围
     policy_freq = 2  # policy延迟更新频率（actor）
+
+    log_interval = 10  # 输出间隔次数
+    max_episodes = 10000  # 最大训练episodes
+    max_timesteps = 1500 # 单个episode的最大步数
+    n_latent_var = 64  # 隐藏层数量
+    update_timestep = 1  # 更新policy的间隔
+    load_model = 0  # 加载模型选项
+    save_model = 1  # 保存模型选项
+
     #############################################
 
-    # Set seeds
+    # 设置seeds
     env.seed(seed)
     env.action_space.seed(seed)
     torch.manual_seed(seed)
     np.random.seed(seed)
-
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
-    max_action = float(env.action_space.high[0])
 
     kwargs = {
         "state_dim": state_dim,
@@ -253,54 +259,69 @@ def main():
     policy = TD3(**kwargs)
     # 初始化buffer
     replay_buffer = ReplayBuffer(state_dim, action_dim)
+
     # 参数初始化
     episode_reward = 0
     episode_timesteps = 0
     episode_num = 0
+    avg_length = 0
+
+    #加载模型文件
+    file_name = f"{'TD3'}_{env_name}_{seed}"
+    if not os.path.exists("./models"):
+        os.makedirs("./models")
+    if load_model:
+        policy_file = file_name
+        policy.load(f"./models/{policy_file}")
+
 
     # 主循环
-    for t in range(int(max_timesteps)):
-        state, done = env.reset(), False
-        episode_timesteps += 1
+    for i_episode in range(1, max_episodes + 1):
+        state = env.reset()
+        for t in range(max_timesteps):
+            episode_timesteps += 1
 
-        # 选择Action
-        if t < start_timesteps: # 初始先随机跑，存数据
-            action = env.action_space.sample()  # 随机从动作空间中选取动作
-        else:
-            action = (
-                    policy.select_action(np.array(state))
-                    + np.random.normal(0, max_action * expl_noise, size=action_dim)  # 加入噪声
-            ).clip(-max_action, max_action)
+            # 选择Action
+            if (i_episode * max_timesteps < start_timesteps) and load_model == 0:  # 初始先随机跑，存数据
+                action = env.action_space.sample()  # 随机从动作空间中选取动作
+            else:
+                action = (
+                        policy.select_action(np.array(state))
+                        + np.random.normal(0, max_action * expl_noise, size=action_dim)  # 加入噪声
+                ).clip(-max_action, max_action)
 
-        # 得到（新的状态，奖励，是否终止，额外的调试信息）
-        next_state, reward, done, _ = env.step(action)
-        done_bool = float(done) if episode_timesteps < env._max_episode_steps else 0
+            # 得到（新的状态，奖励，是否终止，额外的调试信息）
+            next_state, reward, done, _ = env.step(action)
+            done_bool = float(done) #if episode_timesteps < env._max_episode_steps else 0
+            # 保存数据
+            replay_buffer.add(state, action, next_state, reward, done_bool)
 
-        # 保存数据
-        replay_buffer.add(state, action, next_state, reward, done_bool)
+            state = next_state
+            episode_reward += reward
+            # 更新policy
+            if episode_timesteps % update_timestep == 0:
+                policy.train(replay_buffer, batch_size)
+                episode_timesteps = 0
 
-        state = next_state
-        episode_reward += reward
-        env.render()
+            if render:
+                env.render()
+            if done:
+                break
 
-        # 训练policy
-        if t >= start_timesteps:  # 收集到足够多的数据
-            policy.train(replay_buffer, batch_size)
+        avg_length += t
 
-        if done:
-            # +1 to account for 0 indexing. +0 on ep_timesteps since it will increment +1 even if done=True
-            print(
-                f"Total T: {t + 1} Episode Num: {episode_num + 1} Episode T: {episode_timesteps} Reward: {episode_reward:.3f}")
-            # 数据清零
+        # 打印log
+        if i_episode % log_interval == 0:
+            avg_length = int(avg_length / log_interval)
+            episode_reward = int((episode_reward / log_interval))
+
+            print('Episode {} \t Avg length: {} \t Avg reward: {}'.format(i_episode, avg_length, episode_reward))
+            # 保存模型
+            if save_model:
+                policy.save(f"./models/{file_name}")
+
             episode_reward = 0
-            episode_timesteps = 0
-            episode_num += 1
-
-        # # Evaluate episode
-        # if (t + 1) % eval_freq == 0:
-        #     evaluations.append(eval_policy(policy, env, seed))
-        #     np.save(f"./results/{file_name}", evaluations)
-        #     if save_model: policy.save(f"./models/{file_name}")
+            avg_length = 0
 
 
 if __name__ == '__main__':
