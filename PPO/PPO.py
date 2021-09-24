@@ -138,7 +138,7 @@ def main():
     env = gym.make(env_name)
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
-    render = True
+    render = False
 
     log_interval = 20  # 输出间隔次数
     max_episodes = 50000  # 最大训练episodes
